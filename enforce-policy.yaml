@@ -1,0 +1,128 @@
+---
+# =============================================================================
+# scenarios/ai-workload/enforce-policy.yaml -- ENFORCE (SIGKILL, namespaced, OSS)
+#
+# Verbatim port of scenarios/ai-workload/enforce-policy.yaml, relocated to the
+# ai-workload-oss namespace. TracingPolicyNamespaced -- each Sigkill emits a
+# PROCESS_KPROBE event with action=KPROBE_ACTION_SIGKILL. Query the kills
+# with policy_name="ai-workload-oss-enforce" AND action="KPROBE_ACTION_SIGKILL".
+#
+# LAYERED enforcement -- three of the four controls that break the chain:
+#   A. security_bprm_check SIGKILL -> "the agent can THINK but can't SHELL OUT":
+#                                     any shell / downloader the MCP execute tool
+#                                     spawns (steps 1-2) is killed at exec.
+#                                     LIVE-VERIFIED (1.19, 2026-08-12): the SIGKILL
+#                                     IS delivered at exec for BOTH steps -- the
+#                                     step-2 sh dies before wget ever runs, so
+#                                     wget's tcp_v4_connect is never reached.
+#                                     Control A is the deterministic stop for 1
+#                                     AND 2; the wget entry in Control D below is
+#                                     an unfired defence-in-depth backstop.
+#   B. fd_install SIGKILL          -> stops credential + crown-jewel theft: a
+#                                     cat spawned by the MCP read_file tool (steps
+#                                     3-4) reading the secret or weights is killed
+#                                     at open.
+#   D. tcp_v4_connect SIGKILL      -> stops rogue egress: nc AND wget spawned by
+#                                     the MCP execute tool (step 6) is killed at
+#                                     connect().
+#
+# The MCP server's own runtime is python3, deliberately NOT in the fd_install or
+# tcp_v4_connect kill-lists: the legit server reads its own weights + secret and
+# serves over a socket. The remaining control (C) that breaks the python fetch
+# tool egress (link 5) is the CiliumNetworkPolicy in network-policy.yaml
+# (microsegmentation at L3/L4) -- "the agent can't WALK OUT" is proven by the
+# NETWORK layer, now made meaningful because the call arrives over the real
+# pod network (agent-driver.ai-agent-oss -> ai-inference.ai-workload-oss)
+# rather than kubectl-exec loopback.
+#
+# TRAP: TracingPolicyNamespaced only binds pods whose cgroup registers AFTER it
+# loads. attack.sh recycles the AI pod before the enforce pass so the policy
+# applies.
+# =============================================================================
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicyNamespaced
+metadata:
+  name: ai-workload-oss-enforce
+  namespace: ai-workload-oss
+  annotations:
+    scenario: ai-workload-oss
+    mitre: "T1059.004,T1059,T1204,T1552,T1005,T1071.001"
+    paired-with: ai-workload-oss-observe
+spec:
+  podSelector:
+    matchLabels:
+      app: ai-inference
+  kprobes:
+    # -- Control A: SIGKILL the shell the MCP execute tool spawns ----------------
+    - call: "security_bprm_check"
+      syscall: false
+      args:
+        - index: 0
+          type: "linux_binprm"
+      selectors:
+        - matchArgs:
+            - index: 0
+              operator: "Prefix"
+              values:
+                - "/bin/sh"
+                - "/bin/bash"
+                - "/bin/ash"
+                - "/bin/dash"
+                - "/usr/bin/sh"
+                - "/usr/bin/bash"
+                - "/bin/busybox"
+          matchActions:
+            - action: Sigkill
+    # -- Control B: SIGKILL cat spawned by MCP read_file on secret/weights -------
+    - call: "fd_install"
+      syscall: false
+      args:
+        - index: 0
+          type: "int"
+        - index: 1
+          type: "file"
+      selectors:
+        - matchArgs:
+            - index: 1
+              operator: "Prefix"
+              values:
+                - "/etc/ai/"
+                - "/models/"
+          matchBinaries:
+            - operator: "In"
+              values:
+                - "/bin/busybox"
+                - "/bin/cat"
+                - "/usr/bin/cat"
+                - "/usr/bin/head"
+                - "/bin/nc"
+                - "/usr/bin/nc"
+          matchActions:
+            - action: Sigkill
+    # -- Control D: SIGKILL nc/wget spawned by MCP execute tool (steps 2, 6) -----
+    #    nc (step 6) is killed here at connect(). wget (step 2) is listed as a
+    #    defence-in-depth backstop -- it reports its INVOKED literal path
+    #    ("/usr/bin/wget"), not the busybox-resolved one -- but LIVE-VERIFIED
+    #    (1.19, 2026-08-12) it never fires: Control A SIGKILLs the step-2 sh at
+    #    exec before wget ever runs, so the real deterministic stop for step 2
+    #    is Control A, not this.
+    - call: "tcp_v4_connect"
+      syscall: false
+      args:
+        - index: 0
+          type: "sock"
+      selectors:
+        - matchBinaries:
+            - operator: "In"
+              values:
+                - "/bin/busybox"
+                - "/usr/bin/nc"
+                - "/bin/nc"
+                - "/usr/bin/wget"
+                - "/bin/wget"
+                - "/bin/bash"
+                - "/usr/bin/bash"
+                - "/bin/sh"
+                - "/usr/bin/sh"
+          matchActions:
+            - action: Sigkill
