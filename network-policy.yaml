@@ -1,0 +1,91 @@
+---
+# =============================================================================
+# scenarios/ai-workload/network-policy.yaml -- ENFORCE (microsegmentation, OSS)
+#
+# Control C, and a DIFFERENT Tetragon/Cilium feature from the SIGKILL kprobes:
+# zero-trust microsegmentation via CiliumNetworkPolicy -- a core OSS Cilium
+# L3/L4 feature, confirmed against quay.io/cilium/cilium:v1.19.5 on <your-k3s-host>.
+#
+# TWO policies here (the second is new vs. scenarios/ai-workload, and only
+# possible/meaningful because ai-workload-oss puts the MCP server in its own
+# namespace, so agent->server calls are now real pod-network traffic):
+#
+# 1. ai-workload-oss-egress-deny -- selects ONLY the AI workload
+#    (app: ai-inference) and grants it egress to DNS alone. The moment it is
+#    applied, the AI pod is default-deny for every other destination -- so the
+#    MODEL-WEIGHTS EXFIL link (a python3 socket carrying the weights out) is
+#    dropped at L3/L4, before any payload leaves. "The model can't WALK OUT."
+#    Why python3 is not in the enforce kprobe kill-list: we want that link
+#    severed by the NETWORK layer, visibly and independently of the
+#    process-connect SIGKILL that handles shell/nc egress -- a SIGKILL on
+#    python connects would take the model down; microsegmentation contains
+#    the exfil without touching the model.
+#
+# 2. ai-workload-oss-ingress-allow -- NEW vs. the Enterprise-lab scenario.
+#    Restricts who may even REACH the MCP tool server's port 8080 to the
+#    ai-agent-oss namespace only (where agent-driver, the pod attack.sh execs
+#    into, lives). In scenarios/ai-workload this control could not exist
+#    (or would be meaningless) because the "agent" was kubectl-exec'd loopback
+#    inside the SAME pod as the server -- there was no separate network
+#    identity to allow-list. Splitting the agent into ai-agent-oss makes this
+#    a genuine, demonstrable zero-trust ingress boundary: only the AI agent's
+#    own driver pod can call the tool server; any other namespace's attempt to
+#    reach ai-inference:8080 is dropped before the MCP dispatch code ever runs.
+#
+# Scope: selecting only app: ai-inference for egress-deny means neighbouring
+# workloads keep their connectivity, and a neutral pod in ai-agent-oss can
+# still reach http://ai-inference.ai-workload-oss.svc:8080/health to prove the
+# model kept serving. cleanup.sh removes both policies.
+# =============================================================================
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: ai-workload-oss-egress-deny
+  namespace: ai-workload-oss
+  annotations:
+    scenario: ai-workload-oss
+    mitre: "T1041"
+    paired-with: ai-workload-oss-observe
+spec:
+  endpointSelector:
+    matchLabels:
+      app: ai-inference
+  egress:
+    # Allow DNS only -- everything else (model-weights exfil, external egress)
+    # is denied for the AI pod once this policy binds.
+    - toEndpoints:
+        - matchLabels:
+            "k8s:io.kubernetes.pod.namespace": kube-system
+            "k8s:k8s-app": kube-dns
+      toPorts:
+        - ports:
+            - port: "53"
+              protocol: UDP
+            - port: "53"
+              protocol: TCP
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: ai-workload-oss-ingress-allow
+  namespace: ai-workload-oss
+  annotations:
+    scenario: ai-workload-oss
+    mitre: "T1071.001"
+    paired-with: ai-workload-oss-observe
+spec:
+  endpointSelector:
+    matchLabels:
+      app: ai-inference
+  ingress:
+    # Only the agent's own driver pod (ai-agent-oss namespace) may call the
+    # MCP tool server -- everything else is denied ingress by default once
+    # this policy binds.
+    - fromEndpoints:
+        - matchLabels:
+            "k8s:io.kubernetes.pod.namespace": ai-agent-oss
+            "k8s:app": agent-driver
+      toPorts:
+        - ports:
+            - port: "8080"
+              protocol: TCP
